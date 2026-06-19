@@ -499,7 +499,11 @@ def cmd(args, input_values=None, on_input=None, encoding="gbk", chunk_size=1024,
 # MCP Server & Tools
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("python-repl")
+mcp = FastMCP(
+    "python-repl",
+    host=os.environ.get("MCP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("MCP_PORT", "8000")),
+)
 
 manager = SessionManager()
 
@@ -911,9 +915,102 @@ def save_script(
         return json.dumps({"status": "error", "message": f"Failed to write file: {str(ex)}"})
 
 
+@mcp.tool()
+def run_file(
+    session_id: str,
+    path: str,
+    timeout: int | None = None,
+) -> str:
+    """Execute a Python file in the specified session.
+
+    Reads the file content and executes it within the session's namespace,
+    equivalent to running `exec(open(path).read())` in the session.
+    The file's parent directory is temporarily added to sys.path during execution.
+
+    Args:
+        session_id: The session to execute the file in.
+        path: Path to the Python file to execute.
+        timeout: Execution timeout in seconds. Default is None (no timeout).
+
+    Returns:
+        The execution result formatted as interactive Python REPL output.
+    """
+    try:
+        session = manager.get_session(session_id)
+    except KeyError as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+    abs_path = os.path.abspath(path)
+    if not os.path.isfile(abs_path):
+        return json.dumps({"status": "error", "message": f"File not found: '{abs_path}'"})
+
+    try:
+        with open(abs_path, "r", encoding="utf-8") as f:
+            code = f.read()
+    except Exception as ex:
+        return json.dumps({"status": "error", "message": f"Failed to read file: {str(ex)}"})
+
+    if not code.strip():
+        return json.dumps({"status": "error", "message": "File is empty"})
+
+    # Temporarily add the file's directory to sys.path
+    file_dir = os.path.dirname(abs_path)
+    path_added = False
+    if file_dir not in sys.path:
+        sys.path.insert(0, file_dir)
+        path_added = True
+
+    # Set __file__ in the session namespace during execution
+    old_file = session.namespace.get("__file__")
+    session.namespace["__file__"] = abs_path
+
+    try:
+        record = execute_code(session, code, timeout=timeout)
+    finally:
+        # Restore __file__
+        if old_file is None:
+            session.namespace.pop("__file__", None)
+        else:
+            session.namespace["__file__"] = old_file
+        # Remove temporarily added path
+        if path_added and file_dir in sys.path:
+            sys.path.remove(file_dir)
+
+    # Format output
+    line_num = len(session.history)
+    filename = os.path.basename(abs_path)
+
+    parts: list[str] = [f"[{line_num}] >>> exec('{filename}')"]
+
+    if record.success:
+        if record.output:
+            parts.append(record.output)
+    else:
+        if record.error:
+            parts.append(record.error)
+
+    return "\n".join(parts)
+
+
 def main() -> None:
-    """Run the MCP server."""
-    mcp.run()
+    """Run the MCP server.
+
+    Transport mode is controlled by the MCP_TRANSPORT environment variable:
+      - "stdio" (default): Standard input/output transport
+      - "sse": Server-Sent Events over HTTP
+      - "streamable-http": Streamable HTTP transport
+
+    For HTTP-based transports (sse, streamable-http), additional env vars:
+      - MCP_HOST: Host to bind (default "127.0.0.1")
+      - MCP_PORT: Port to bind (default 8000)
+    """
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    if transport not in ("stdio", "sse", "streamable-http"):
+        raise ValueError(
+            f"Invalid MCP_TRANSPORT='{transport}'. "
+            f"Must be one of: stdio, sse, streamable-http"
+        )
+    mcp.run(transport=transport)
 
 
 if __name__ == "__main__":
