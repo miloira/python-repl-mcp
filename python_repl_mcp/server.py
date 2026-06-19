@@ -18,6 +18,65 @@ from typing import Any, cast
 from mcp.server.fastmcp import FastMCP
 
 # ---------------------------------------------------------------------------
+# Thread-local stdout/stderr proxy for concurrent output isolation
+# ---------------------------------------------------------------------------
+
+_thread_local = threading.local()
+
+
+class _ThreadLocalStream:
+    """A stream proxy that routes writes to a thread-local buffer when set,
+    otherwise falls through to the original stream.
+
+    This allows concurrent code executions in different threads to capture
+    their own stdout/stderr independently without interfering with each other.
+    """
+
+    def __init__(self, original: Any, attr_name: str) -> None:
+        self._original = original
+        self._attr_name = attr_name  # e.g. "stdout" or "stderr"
+
+    def write(self, data: str) -> int:
+        stream = getattr(_thread_local, self._attr_name, None)
+        if stream is not None:
+            return stream.write(data)
+        return self._original.write(data)
+
+    def flush(self) -> None:
+        stream = getattr(_thread_local, self._attr_name, None)
+        if stream is not None:
+            stream.flush()
+        else:
+            self._original.flush()
+
+    def fileno(self) -> int:
+        return self._original.fileno()
+
+    def isatty(self) -> bool:
+        return self._original.isatty()
+
+    @property
+    def encoding(self) -> str:
+        return self._original.encoding
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate any other attribute access to the original stream
+        return getattr(self._original, name)
+
+
+# Install thread-local stream proxies at module load time.
+# After this, any thread can set _thread_local.stdout / _thread_local.stderr
+# to a StringIO to capture its own output without affecting other threads.
+_original_stdout = sys.stdout
+_original_stderr = sys.stderr
+sys.stdout = _ThreadLocalStream(_original_stdout, "stdout")  # type: ignore[assignment]
+sys.stderr = _ThreadLocalStream(_original_stderr, "stderr")  # type: ignore[assignment]
+
+# Global lock for process-wide state: cwd changes and sys.path modifications
+_cwd_lock = threading.Lock()
+_path_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------
 
@@ -52,6 +111,7 @@ class Session:
     history: list[ExecutionRecord] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     _initial_modules: set[str] = field(default_factory=set, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def __post_init__(self) -> None:
         """Snapshot initial interpreter state at creation time."""
@@ -208,6 +268,7 @@ class SessionManager:
 
     def __init__(self) -> None:
         self._sessions: dict[str, Session] = {}
+        self._lock = threading.Lock()
 
     def create_session(
         self,
@@ -219,64 +280,73 @@ class SessionManager:
         if session_id is None:
             session_id = str(uuid.uuid4())[:8]
 
-        if session_id in self._sessions:
-            raise ValueError(f"Session '{session_id}' already exists")
+        with self._lock:
+            if session_id in self._sessions:
+                raise ValueError(f"Session '{session_id}' already exists")
 
-        if cwd is not None:
-            cwd = os.path.abspath(cwd)
-            if not os.path.isdir(cwd):
-                raise ValueError(f"Working directory '{cwd}' does not exist")
+            if cwd is not None:
+                cwd = os.path.abspath(cwd)
+                if not os.path.isdir(cwd):
+                    raise ValueError(f"Working directory '{cwd}' does not exist")
 
-        resolved_paths: list[str] = []
-        if sys_paths:
-            for p in sys_paths:
-                abs_path = os.path.abspath(p)
-                resolved_paths.append(abs_path)
-                if abs_path not in sys.path:
-                    sys.path.insert(0, abs_path)
+            resolved_paths: list[str] = []
+            if sys_paths:
+                for p in sys_paths:
+                    abs_path = os.path.abspath(p)
+                    resolved_paths.append(abs_path)
 
-        if cwd and cwd not in sys.path:
-            sys.path.insert(0, cwd)
+            with _path_lock:
+                if sys_paths:
+                    for abs_path in resolved_paths:
+                        if abs_path not in sys.path:
+                            sys.path.insert(0, abs_path)
+                if cwd and cwd not in sys.path:
+                    sys.path.insert(0, cwd)
 
-        session = Session(session_id=session_id, cwd=cwd, sys_paths=resolved_paths)
-        self._sessions[session_id] = session
-        return session
+            session = Session(session_id=session_id, cwd=cwd, sys_paths=resolved_paths)
+            self._sessions[session_id] = session
+            return session
 
     def get_session(self, session_id: str) -> Session:
         """Get an existing session by ID."""
-        if session_id not in self._sessions:
-            raise KeyError(f"Session '{session_id}' not found")
-        return self._sessions[session_id]
+        with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session '{session_id}' not found")
+            return self._sessions[session_id]
 
     def delete_session(self, session_id: str) -> None:
         """Delete a session."""
-        if session_id not in self._sessions:
-            raise KeyError(f"Session '{session_id}' not found")
-        del self._sessions[session_id]
+        with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session '{session_id}' not found")
+            del self._sessions[session_id]
 
     def reset_session(self, session_id: str) -> None:
         """Reset a session's namespace and history."""
         session = self.get_session(session_id)
-        session.reset()
+        with session._lock:
+            session.reset()
 
     def reset_run_context(self, session_id: str) -> None:
         """Recreate a fresh Python interpreter environment for the session."""
         session = self.get_session(session_id)
-        session.reset_run_context()
+        with session._lock:
+            session.reset_run_context()
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """List all active sessions with metadata."""
-        return [
-            {
-                "session_id": s.session_id,
-                "cwd": s.cwd,
-                "sys_paths": s.sys_paths,
-                "created_at": s.created_at,
-                "history_count": len(s.history),
-                "variable_count": len(s.get_variables()),
-            }
-            for s in self._sessions.values()
-        ]
+        with self._lock:
+            return [
+                {
+                    "session_id": s.session_id,
+                    "cwd": s.cwd,
+                    "sys_paths": s.sys_paths,
+                    "created_at": s.created_at,
+                    "history_count": len(s.history),
+                    "variable_count": len(s.get_variables()),
+                }
+                for s in self._sessions.values()
+            ]
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +358,8 @@ def execute_code(session: Session, code: str, timeout: int | None = None) -> Exe
     """Execute Python code within a session's namespace.
 
     Handles both expressions (returns value) and statements.
-    Captures stdout/stderr. Uses a thread with timeout.
+    Captures stdout/stderr via thread-local streams. Uses a thread with timeout.
+    Acquires the session lock to prevent concurrent executions on the same session.
     """
     if timeout is None:
         timeout = DEFAULT_TIMEOUT
@@ -305,70 +376,75 @@ def execute_code(session: Session, code: str, timeout: int | None = None) -> Exe
         "finished": False,
     }
 
-    old_cwd = os.getcwd()
-
     def _run():
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
+        # Install thread-local capture streams
+        _thread_local.stdout = stdout_capture
+        _thread_local.stderr = stderr_capture
         try:
+            # Acquire the cwd lock and change directory if needed
             if session.cwd:
+                _cwd_lock.acquire()
+                old_cwd = os.getcwd()
                 os.chdir(session.cwd)
 
-            sys.stdout = stdout_capture
-            sys.stderr = stderr_capture
-
-            result = _try_exec(code, session.namespace)
-
-            out = stdout_capture.getvalue()
-            if result is not None:
-                if out:
-                    out += "\n"
-                out += repr(result)
-
-            exec_result["output"] = out
-            exec_result["success"] = True
-
-        except Exception as exc:
-            exec_result["output"] = stdout_capture.getvalue()
-            exec_result["error"] = _format_repl_error(exc)
-            exec_result["success"] = False
-        finally:
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
             try:
-                os.chdir(old_cwd)
-            except Exception:
-                pass
+                result = _try_exec(code, session.namespace)
+
+                out = stdout_capture.getvalue()
+                if result is not None:
+                    if out:
+                        out += "\n"
+                    out += repr(result)
+
+                exec_result["output"] = out
+                exec_result["success"] = True
+
+            except Exception as exc:
+                exec_result["output"] = stdout_capture.getvalue()
+                exec_result["error"] = _format_repl_error(exc)
+                exec_result["success"] = False
+            finally:
+                if session.cwd:
+                    try:
+                        os.chdir(old_cwd)
+                    except Exception:
+                        pass
+                    _cwd_lock.release()
+        finally:
+            # Remove thread-local captures
+            _thread_local.stdout = None
+            _thread_local.stderr = None
             exec_result["finished"] = True
 
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
-    thread.join(timeout=timeout)
+    with session._lock:
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join(timeout=timeout)
 
-    if not exec_result["finished"]:
-        success = False
-        output = stdout_capture.getvalue()
-        error = f"ExecutionTimeout: code execution exceeded {timeout} seconds"
-    else:
-        output = exec_result["output"]
-        error = exec_result["error"]
-        success = exec_result["success"]
+        if not exec_result["finished"]:
+            success = False
+            output = stdout_capture.getvalue()
+            error = f"ExecutionTimeout: code execution exceeded {timeout} seconds"
+        else:
+            output = exec_result["output"]
+            error = exec_result["error"]
+            success = exec_result["success"]
 
-    stderr_output = stderr_capture.getvalue()
-    if stderr_output and stderr_output not in error:
-        if error:
-            error += "\n"
-        error += stderr_output
+        stderr_output = stderr_capture.getvalue()
+        if stderr_output and stderr_output not in error:
+            if error:
+                error += "\n"
+            error += stderr_output
 
-    record = ExecutionRecord(
-        code=code,
-        output=output.rstrip() if output else "",
-        error=error.rstrip() if error else "",
-        timestamp=time.time(),
-        success=success,
-    )
-    session.history.append(record)
-    return record
+        record = ExecutionRecord(
+            code=code,
+            output=output.rstrip() if output else "",
+            error=error.rstrip() if error else "",
+            timestamp=time.time(),
+            success=success,
+        )
+        session.history.append(record)
+        return record
 
 
 def _format_repl_error(exc: BaseException) -> str:
@@ -956,9 +1032,10 @@ def run_file(
     # Temporarily add the file's directory to sys.path
     file_dir = os.path.dirname(abs_path)
     path_added = False
-    if file_dir not in sys.path:
-        sys.path.insert(0, file_dir)
-        path_added = True
+    with _path_lock:
+        if file_dir not in sys.path:
+            sys.path.insert(0, file_dir)
+            path_added = True
 
     # Set __file__ in the session namespace during execution
     old_file = session.namespace.get("__file__")
@@ -973,8 +1050,10 @@ def run_file(
         else:
             session.namespace["__file__"] = old_file
         # Remove temporarily added path
-        if path_added and file_dir in sys.path:
-            sys.path.remove(file_dir)
+        if path_added:
+            with _path_lock:
+                if file_dir in sys.path:
+                    sys.path.remove(file_dir)
 
     # Format output
     line_num = len(session.history)
