@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import io
 import json
 import multiprocessing
 import os
@@ -9,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
@@ -16,7 +19,136 @@ from typing import Any, cast
 
 from mcp.server.fastmcp import FastMCP
 
-from .worker import worker_main
+
+# ---------------------------------------------------------------------------
+# Worker - runs in a separate process for true isolation
+# ---------------------------------------------------------------------------
+
+
+def _format_repl_error(exc: BaseException) -> str:
+    """Format an exception like the Python interactive REPL."""
+    tb = traceback.extract_tb(exc.__traceback__)
+    repl_frames = [frame for frame in tb if frame.filename == "<repl>"]
+
+    lines = ["Traceback (most recent call last):"]
+    if repl_frames:
+        for frame in repl_frames:
+            lines.append(f'  File "<stdin>", line {frame.lineno}, in {frame.name}')
+            if frame.line:
+                lines.append(f"    {frame.line}")
+    else:
+        lines.append('  File "<stdin>", line 1, in <module>')
+
+    exc_line = traceback.format_exception_only(type(exc), exc)
+    lines.extend(line.rstrip() for line in exc_line)
+
+    return "\n".join(lines)
+
+
+def _try_exec(code: str, namespace: dict) -> object | None:
+    """Execute code, returning the result if it's a single expression."""
+    tree = ast.parse(code)
+
+    if not tree.body:
+        return None
+
+    last = tree.body[-1]
+
+    if isinstance(last, ast.Expr):
+        if len(tree.body) > 1:
+            module = ast.Module(body=tree.body[:-1], type_ignores=[])
+            exec(compile(module, "<repl>", "exec"), namespace)
+
+        expr = ast.Expression(body=last.value)
+        return eval(compile(expr, "<repl>", "eval"), namespace)
+    else:
+        exec(compile(tree, "<repl>", "exec"), namespace)
+        return None
+
+
+def _execute(code: str, namespace: dict) -> dict[str, Any]:
+    """Execute code and capture output."""
+    stdout_capture = io.StringIO()
+    stderr_capture = io.StringIO()
+
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    sys.stdout = stdout_capture
+    sys.stderr = stderr_capture
+
+    try:
+        result = _try_exec(code, namespace)
+
+        out = stdout_capture.getvalue()
+        if result is not None:
+            if out:
+                out += "\n"
+            out += repr(result)
+
+        return {
+            "output": out.rstrip() if out else "",
+            "error": "",
+            "success": True,
+        }
+    except Exception as exc:
+        out = stdout_capture.getvalue()
+        err = _format_repl_error(exc)
+
+        stderr_output = stderr_capture.getvalue()
+        if stderr_output and stderr_output not in err:
+            if err:
+                err += "\n"
+            err += stderr_output
+
+        return {
+            "output": out.rstrip() if out else "",
+            "error": err.rstrip() if err else "",
+            "success": False,
+        }
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+
+
+def worker_main(conn: Connection, cwd: str | None = None) -> None:
+    """Worker event loop. Receives commands via conn, sends back results.
+
+    Protocol:
+        Command: {"cmd": "execute", "code": str}
+        Command: {"cmd": "reset"}
+        Command: {"cmd": "shutdown"}
+
+        Response for execute: {"output": str, "error": str, "success": bool}
+        Response for reset: {"status": "ok"}
+    """
+    if cwd:
+        os.chdir(cwd)
+
+    namespace: dict[str, Any] = {}
+
+    while True:
+        try:
+            msg = conn.recv()
+        except (EOFError, OSError):
+            break
+
+        cmd = msg.get("cmd")
+
+        if cmd == "shutdown":
+            conn.send({"status": "ok"})
+            break
+        elif cmd == "reset":
+            namespace.clear()
+            conn.send({"status": "ok"})
+        elif cmd == "execute":
+            code = msg["code"]
+            result = _execute(code, namespace)
+            conn.send(result)
+        else:
+            conn.send({"status": "error", "message": f"Unknown command: {cmd}"})
+
+    conn.close()
+
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -67,6 +199,28 @@ def _resolve_slice(
 # ---------------------------------------------------------------------------
 
 
+def _log_execution(session_id: str, record: "ExecutionRecord") -> None:
+    """Log execution input/output to stderr (MCP Logs panel)."""
+    separator = "─" * 50
+    print(separator, file=sys.stderr, flush=True)
+    print(f"Session: {session_id} | {len(record.code.splitlines())} lines", file=sys.stderr, flush=True)
+    print(">>> INPUT:", file=sys.stderr, flush=True)
+    for line in record.code.strip().splitlines():
+        print(f"  {line}", file=sys.stderr, flush=True)
+    if record.success:
+        if record.output:
+            print("<<< OUTPUT:", file=sys.stderr, flush=True)
+            for line in record.output.splitlines():
+                print(f"  {line}", file=sys.stderr, flush=True)
+        else:
+            print("<<< (no output)", file=sys.stderr, flush=True)
+    else:
+        print("<<< ERROR:", file=sys.stderr, flush=True)
+        for line in record.error.splitlines():
+            print(f"  {line}", file=sys.stderr, flush=True)
+    print(separator, file=sys.stderr, flush=True)
+
+
 @dataclass
 class Session:
     """A Python REPL session backed by a dedicated worker process."""
@@ -76,6 +230,7 @@ class Session:
     _conn: Connection
     history: list[ExecutionRecord] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
+    cwd: str | None = None
 
     def is_alive(self) -> bool:
         return self._process.is_alive()
@@ -127,6 +282,10 @@ class Session:
             success=result.get("success", True),
         )
         self.history.append(record)
+
+        # Log input/output to MCP Logs panel
+        _log_execution(self.session_id, record)
+
         return record
 
     def reset(self) -> None:
@@ -174,7 +333,7 @@ class Session:
         parent_conn, child_conn = multiprocessing.Pipe()
         process = multiprocessing.Process(
             target=worker_main,
-            args=(child_conn,),
+            args=(child_conn, self.cwd),
             daemon=True,
         )
         process.start()
@@ -227,7 +386,7 @@ class SessionManager:
         self._sessions: dict[str, Session] = {}
         self._lock = threading.Lock()
 
-    def create_session(self, session_id: str | None = None) -> Session:
+    def create_session(self, session_id: str | None = None, cwd: str | None = None) -> Session:
         """Create a new session with a dedicated worker process."""
         if session_id is None:
             session_id = str(uuid.uuid4())[:8]
@@ -239,7 +398,7 @@ class SessionManager:
             parent_conn, child_conn = multiprocessing.Pipe()
             process = multiprocessing.Process(
                 target=worker_main,
-                args=(child_conn,),
+                args=(child_conn, cwd),
                 daemon=True,
             )
             process.start()
@@ -249,6 +408,7 @@ class SessionManager:
                 session_id=session_id,
                 _process=process,
                 _conn=parent_conn,
+                cwd=cwd,
             )
             self._sessions[session_id] = session
             return session
@@ -365,7 +525,7 @@ manager = SessionManager()
 
 
 @mcp.tool()
-def create_session(session_id: str | None = None) -> str:
+def create_session(session_id: str | None = None, cwd: str | None = None) -> str:
     """Create a new Python REPL session.
 
     Each session has its own isolated namespace for variable storage
@@ -373,12 +533,13 @@ def create_session(session_id: str | None = None) -> str:
 
     Args:
         session_id: Optional custom session ID. Auto-generated if not provided.
+        cwd: Optional working directory for the session. Defaults to server's cwd.
 
     Returns:
         JSON with the created session info.
     """
     try:
-        session = manager.create_session(session_id)
+        session = manager.create_session(session_id, cwd=cwd)
         return json.dumps({
             "status": "success",
             "session_id": session.session_id,
