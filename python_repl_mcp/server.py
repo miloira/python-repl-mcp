@@ -1,80 +1,22 @@
-"""MCP Server for Python REPL - sessions, execution, and tool definitions."""
+"""MCP Server for Python REPL - sessions with process-level isolation."""
 
 from __future__ import annotations
 
-import ast
-import io
 import json
+import multiprocessing
 import os
 import subprocess
 import sys
 import threading
 import time
-import traceback
 import uuid
 from dataclasses import dataclass, field
+from multiprocessing.connection import Connection
 from typing import Any, cast
 
 from mcp.server.fastmcp import FastMCP
 
-# ---------------------------------------------------------------------------
-# Thread-local stdout/stderr proxy for concurrent output isolation
-# ---------------------------------------------------------------------------
-
-_thread_local = threading.local()
-
-
-class _ThreadLocalStream:
-    """A stream proxy that routes writes to a thread-local buffer when set,
-    otherwise falls through to the original stream.
-
-    This allows concurrent code executions in different threads to capture
-    their own stdout/stderr independently without interfering with each other.
-    """
-
-    def __init__(self, original: Any, attr_name: str) -> None:
-        self._original = original
-        self._attr_name = attr_name  # e.g. "stdout" or "stderr"
-
-    def write(self, data: str) -> int:
-        stream = getattr(_thread_local, self._attr_name, None)
-        if stream is not None:
-            return stream.write(data)
-        return self._original.write(data)
-
-    def flush(self) -> None:
-        stream = getattr(_thread_local, self._attr_name, None)
-        if stream is not None:
-            stream.flush()
-        else:
-            self._original.flush()
-
-    def fileno(self) -> int:
-        return self._original.fileno()
-
-    def isatty(self) -> bool:
-        return self._original.isatty()
-
-    @property
-    def encoding(self) -> str:
-        return self._original.encoding
-
-    def __getattr__(self, name: str) -> Any:
-        # Delegate any other attribute access to the original stream
-        return getattr(self._original, name)
-
-
-# Install thread-local stream proxies at module load time.
-# After this, any thread can set _thread_local.stdout / _thread_local.stderr
-# to a StringIO to capture its own output without affecting other threads.
-_original_stdout = sys.stdout
-_original_stderr = sys.stderr
-sys.stdout = _ThreadLocalStream(_original_stdout, "stdout")  # type: ignore[assignment]
-sys.stderr = _ThreadLocalStream(_original_stderr, "stderr")  # type: ignore[assignment]
-
-# Global lock for process-wide state: cwd changes and sys.path modifications
-_cwd_lock = threading.Lock()
-_path_lock = threading.Lock()
+from .worker import worker_main
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -92,7 +34,32 @@ class ExecutionRecord:
     error: str
     timestamp: float = field(default_factory=time.time)
     success: bool = True
-    record_type: str = "python"  # "python" for code, "system" for markers
+
+
+# ---------------------------------------------------------------------------
+# Slice resolution utility
+# ---------------------------------------------------------------------------
+
+
+def _resolve_slice(
+    start: int | None,
+    end: int | None,
+    total: int,
+) -> tuple[int, int]:
+    """Resolve start/end to a Python slice range [s, e).
+
+    Identical to Python's slice(start, end).indices(total),
+    following standard Python slicing conventions:
+      - 0-based indexing.
+      - Half-open interval: [start, end) — start inclusive, end exclusive.
+      - Negative values count from end: -1 = last item, -2 = second to last.
+      - None defaults: start=None → 0, end=None → total.
+      - Out-of-range values are clamped gracefully.
+
+    Returns a tuple (s, e) suitable for list[s:e].
+    """
+    s, e, _ = slice(start, end).indices(total)
+    return s, e
 
 
 # ---------------------------------------------------------------------------
@@ -102,145 +69,135 @@ class ExecutionRecord:
 
 @dataclass
 class Session:
-    """A Python REPL session with its own namespace and execution history."""
+    """A Python REPL session backed by a dedicated worker process."""
 
     session_id: str
-    cwd: str | None = None
-    sys_paths: list[str] = field(default_factory=list)
-    namespace: dict[str, Any] = field(default_factory=dict)
+    _process: multiprocessing.Process
+    _conn: Connection
     history: list[ExecutionRecord] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
-    _initial_modules: set[str] = field(default_factory=set, repr=False)
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    def __post_init__(self) -> None:
-        """Snapshot initial interpreter state at creation time."""
-        if not self._initial_modules:
-            self._initial_modules = set(sys.modules.keys())
+    def is_alive(self) -> bool:
+        return self._process.is_alive()
+
+    def execute(self, code: str, timeout: int | None = None) -> ExecutionRecord:
+        """Send code to the worker and get the result."""
+        try:
+            self._conn.send({"cmd": "execute", "code": code})
+        except (OSError, BrokenPipeError):
+            # Worker crashed before we could send - restart and retry
+            self._restart_worker()
+            self._conn.send({"cmd": "execute", "code": code})
+
+        if timeout is not None:
+            if not self._conn.poll(timeout):
+                # Timeout - kill and restart worker
+                self._kill_worker()
+                self._start_worker()
+                record = ExecutionRecord(
+                    code=code,
+                    output="",
+                    error=f"ExecutionTimeout: code execution exceeded {timeout} seconds",
+                    timestamp=time.time(),
+                    success=False,
+                )
+                self.history.append(record)
+                return record
+
+        try:
+            result = self._conn.recv()
+        except (EOFError, OSError):
+            # Worker crashed during execution - restart
+            self._restart_worker()
+            record = ExecutionRecord(
+                code=code,
+                output="",
+                error="WorkerCrash: worker process died unexpectedly, session has been restarted",
+                timestamp=time.time(),
+                success=False,
+            )
+            self.history.append(record)
+            return record
+
+        record = ExecutionRecord(
+            code=code,
+            output=result.get("output", ""),
+            error=result.get("error", ""),
+            timestamp=time.time(),
+            success=result.get("success", True),
+        )
+        self.history.append(record)
+        return record
 
     def reset(self) -> None:
-        """Reset the session namespace and history."""
-        self.namespace.clear()
+        """Reset namespace and history."""
+        self._conn.send({"cmd": "reset"})
+        self._conn.recv()
         self.history.clear()
 
     def reset_run_context(self) -> None:
-        """Recreate a fresh Python interpreter execution environment.
+        """Kill the worker and start a fresh one. History is preserved."""
+        self._kill_worker()
+        self._start_worker()
 
-        This goes beyond a simple reset by also:
-        - Removing any modules imported during the session from sys.modules
-        - Restoring sys.path to its state before session-specific additions
-        - Creating a completely clean namespace (as if a new interpreter started)
-        - Appending a reset marker to history (history is preserved)
-        """
-        # Remove modules that were imported during this session
-        current_modules = set(sys.modules.keys())
-        session_modules = current_modules - self._initial_modules
-        for mod_name in session_modules:
-            try:
-                del sys.modules[mod_name]
-            except KeyError:
-                pass
+    def shutdown(self) -> None:
+        """Gracefully shut down the worker process."""
+        try:
+            self._conn.send({"cmd": "shutdown"})
+            self._process.join(timeout=2)
+        except (OSError, EOFError):
+            pass
+        if self._process.is_alive():
+            self._process.kill()
+            self._process.join(timeout=1)
+        self._conn.close()
 
-        # Remove session-specific sys.path entries
-        for p in self.sys_paths:
-            try:
-                sys.path.remove(p)
-            except ValueError:
-                pass
-        if self.cwd and self.cwd in sys.path:
-            try:
-                sys.path.remove(self.cwd)
-            except ValueError:
-                pass
+    def _kill_worker(self) -> None:
+        """Force kill the worker process."""
+        try:
+            self._process.kill()
+            self._process.join(timeout=2)
+        except Exception:
+            pass
+        self._conn.close()
 
-        # Re-add session paths (fresh start, same config)
-        for p in self.sys_paths:
-            if p not in sys.path:
-                sys.path.insert(0, p)
-        if self.cwd and self.cwd not in sys.path:
-            sys.path.insert(0, self.cwd)
-
-        # Clear namespace only, keep history
-        self.namespace.clear()
-
-        # Append a reset marker to history
-        self.history.append(ExecutionRecord(
-            code="--- runtime context reset ---",
-            output="",
-            error="",
-            timestamp=time.time(),
-            success=True,
-            record_type="system",
-        ))
-
-        # Re-snapshot modules for the new clean state
-        self._initial_modules = set(sys.modules.keys())
-
-    def get_variables(self) -> dict[str, str]:
-        """Get all user-defined variables with their type and repr."""
-        variables: dict[str, str] = {}
-        for name, value in self.namespace.items():
-            if name.startswith("_"):
-                continue
-            try:
-                variables[name] = f"{type(value).__name__}: {repr(value)}"
-            except Exception:
-                variables[name] = f"{type(value).__name__}: <unable to repr>"
-        return variables
-
-    def get_history(self, n: int | None = None) -> list[dict[str, Any]]:
-        """Get execution history as structured data."""
-        if n is None:
-            start = 0
+    def _restart_worker(self) -> None:
+        """Kill worker if alive and start a fresh one."""
+        if self._process.is_alive():
+            self._kill_worker()
         else:
-            start = max(0, len(self.history) - n)
-        return [
-            {
-                "index": start + i,
-                "code": r.code,
-                "output": r.output,
-                "error": r.error,
-                "success": r.success,
-                "timestamp": r.timestamp,
-                "record_type": r.record_type,
-            }
-            for i, r in enumerate(self.history[start:])
-        ]
+            self._conn.close()
+        self._start_worker()
 
-    def format_history(self, n: int | None = None) -> str:
-        """Format execution history like a Python interactive REPL with line numbers.
+    def _start_worker(self) -> None:
+        """Start a new worker process."""
+        parent_conn, child_conn = multiprocessing.Pipe()
+        process = multiprocessing.Process(
+            target=worker_main,
+            args=(child_conn,),
+            daemon=True,
+        )
+        process.start()
+        child_conn.close()
+        self._process = process
+        self._conn = parent_conn
 
-        Output style:
-            [1] >>> a = 1
-            [2] >>> a
-            1
-            [3] [system] --- runtime context reset ---
-            [4] >>> b
-            Traceback (most recent call last):
-              File "<stdin>", line 1, in <module>
-            NameError: name 'b' is not defined
-        """
-        records = self.history if n is None else self.history[-n:]
+    def format_history(self, start: int | None = None, end: int | None = None) -> str:
+        """Format execution history like a Python interactive REPL."""
+        total = len(self.history)
+        s, e = _resolve_slice(start, end, total)
+        records = self.history[s:e]
         parts: list[str] = []
-        # Determine starting line number (1-based, all records count)
-        if n is None or n >= len(self.history):
-            line_num = 1
-        else:
-            line_num = len(self.history) - n + 1
+        line_num = s + 1
 
         for record in records:
-            if record.record_type == "system":
-                parts.append(f"[{line_num}] [system] {record.code}")
-                parts.append("")
-                line_num += 1
-                continue
-
-            lines = record.code.splitlines()
+            lines = record.code.strip("\n").splitlines()
+            prefix = f"[{line_num}]"
             for i, line in enumerate(lines):
                 if i == 0:
-                    parts.append(f"[{line_num}] >>> {line}")
+                    parts.append(f"{prefix} {line}")
                 else:
-                    parts.append(f"{'':>{len(str(line_num)) + 2}} ... {line}")
+                    parts.append(f"{' ' * len(prefix)} {line}")
 
             if record.success:
                 if record.output:
@@ -264,19 +221,14 @@ class Session:
 
 
 class SessionManager:
-    """Manages multiple Python REPL sessions."""
+    """Manages multiple Python REPL sessions, each in its own process."""
 
     def __init__(self) -> None:
         self._sessions: dict[str, Session] = {}
         self._lock = threading.Lock()
 
-    def create_session(
-        self,
-        session_id: str | None = None,
-        cwd: str | None = None,
-        sys_paths: list[str] | None = None,
-    ) -> Session:
-        """Create a new session."""
+    def create_session(self, session_id: str | None = None) -> Session:
+        """Create a new session with a dedicated worker process."""
         if session_id is None:
             session_id = str(uuid.uuid4())[:8]
 
@@ -284,26 +236,20 @@ class SessionManager:
             if session_id in self._sessions:
                 raise ValueError(f"Session '{session_id}' already exists")
 
-            if cwd is not None:
-                cwd = os.path.abspath(cwd)
-                if not os.path.isdir(cwd):
-                    raise ValueError(f"Working directory '{cwd}' does not exist")
+            parent_conn, child_conn = multiprocessing.Pipe()
+            process = multiprocessing.Process(
+                target=worker_main,
+                args=(child_conn,),
+                daemon=True,
+            )
+            process.start()
+            child_conn.close()
 
-            resolved_paths: list[str] = []
-            if sys_paths:
-                for p in sys_paths:
-                    abs_path = os.path.abspath(p)
-                    resolved_paths.append(abs_path)
-
-            with _path_lock:
-                if sys_paths:
-                    for abs_path in resolved_paths:
-                        if abs_path not in sys.path:
-                            sys.path.insert(0, abs_path)
-                if cwd and cwd not in sys.path:
-                    sys.path.insert(0, cwd)
-
-            session = Session(session_id=session_id, cwd=cwd, sys_paths=resolved_paths)
+            session = Session(
+                session_id=session_id,
+                _process=process,
+                _conn=parent_conn,
+            )
             self._sessions[session_id] = session
             return session
 
@@ -315,23 +261,12 @@ class SessionManager:
             return self._sessions[session_id]
 
     def delete_session(self, session_id: str) -> None:
-        """Delete a session."""
+        """Delete a session and shut down its worker."""
         with self._lock:
             if session_id not in self._sessions:
                 raise KeyError(f"Session '{session_id}' not found")
-            del self._sessions[session_id]
-
-    def reset_session(self, session_id: str) -> None:
-        """Reset a session's namespace and history."""
-        session = self.get_session(session_id)
-        with session._lock:
-            session.reset()
-
-    def reset_run_context(self, session_id: str) -> None:
-        """Recreate a fresh Python interpreter environment for the session."""
-        session = self.get_session(session_id)
-        with session._lock:
-            session.reset_run_context()
+            session = self._sessions.pop(session_id)
+        session.shutdown()
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """List all active sessions with metadata."""
@@ -339,153 +274,12 @@ class SessionManager:
             return [
                 {
                     "session_id": s.session_id,
-                    "cwd": s.cwd,
-                    "sys_paths": s.sys_paths,
                     "created_at": s.created_at,
                     "history_count": len(s.history),
-                    "variable_count": len(s.get_variables()),
+                    "alive": s.is_alive(),
                 }
                 for s in self._sessions.values()
             ]
-
-
-# ---------------------------------------------------------------------------
-# Code executor
-# ---------------------------------------------------------------------------
-
-
-def execute_code(session: Session, code: str, timeout: int | None = None) -> ExecutionRecord:
-    """Execute Python code within a session's namespace.
-
-    Handles both expressions (returns value) and statements.
-    Captures stdout/stderr via thread-local streams. Uses a thread with timeout.
-    Acquires the session lock to prevent concurrent executions on the same session.
-    """
-    if timeout is None:
-        timeout = DEFAULT_TIMEOUT
-
-    # None means no timeout (thread.join with None waits forever)
-
-    stdout_capture = io.StringIO()
-    stderr_capture = io.StringIO()
-
-    exec_result: dict[str, Any] = {
-        "output": "",
-        "error": "",
-        "success": True,
-        "finished": False,
-    }
-
-    def _run():
-        # Install thread-local capture streams
-        _thread_local.stdout = stdout_capture
-        _thread_local.stderr = stderr_capture
-        try:
-            # Acquire the cwd lock and change directory if needed
-            if session.cwd:
-                _cwd_lock.acquire()
-                old_cwd = os.getcwd()
-                os.chdir(session.cwd)
-
-            try:
-                result = _try_exec(code, session.namespace)
-
-                out = stdout_capture.getvalue()
-                if result is not None:
-                    if out:
-                        out += "\n"
-                    out += repr(result)
-
-                exec_result["output"] = out
-                exec_result["success"] = True
-
-            except Exception as exc:
-                exec_result["output"] = stdout_capture.getvalue()
-                exec_result["error"] = _format_repl_error(exc)
-                exec_result["success"] = False
-            finally:
-                if session.cwd:
-                    try:
-                        os.chdir(old_cwd)
-                    except Exception:
-                        pass
-                    _cwd_lock.release()
-        finally:
-            # Remove thread-local captures
-            _thread_local.stdout = None
-            _thread_local.stderr = None
-            exec_result["finished"] = True
-
-    with session._lock:
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
-        thread.join(timeout=timeout)
-
-        if not exec_result["finished"]:
-            success = False
-            output = stdout_capture.getvalue()
-            error = f"ExecutionTimeout: code execution exceeded {timeout} seconds"
-        else:
-            output = exec_result["output"]
-            error = exec_result["error"]
-            success = exec_result["success"]
-
-        stderr_output = stderr_capture.getvalue()
-        if stderr_output and stderr_output not in error:
-            if error:
-                error += "\n"
-            error += stderr_output
-
-        record = ExecutionRecord(
-            code=code,
-            output=output.rstrip() if output else "",
-            error=error.rstrip() if error else "",
-            timestamp=time.time(),
-            success=success,
-        )
-        session.history.append(record)
-        return record
-
-
-def _format_repl_error(exc: BaseException) -> str:
-    """Format an exception like the Python interactive REPL."""
-    tb = traceback.extract_tb(exc.__traceback__)
-    repl_frames = [frame for frame in tb if frame.filename == "<repl>"]
-
-    lines = ["Traceback (most recent call last):"]
-    if repl_frames:
-        for frame in repl_frames:
-            lines.append(f'  File "<stdin>", line {frame.lineno}, in {frame.name}')
-            if frame.line:
-                lines.append(f"    {frame.line}")
-    else:
-        lines.append('  File "<stdin>", line 1, in <module>')
-
-    exc_line = traceback.format_exception_only(type(exc), exc)
-    lines.extend(line.rstrip() for line in exc_line)
-
-    return "\n".join(lines)
-
-
-def _try_exec(code: str, namespace: dict) -> object | None:
-    """Execute code, returning the result if it's a single expression."""
-    tree = ast.parse(code)
-
-    if not tree.body:
-        return None
-
-    last = tree.body[-1]
-
-    if isinstance(last, ast.Expr):
-        if len(tree.body) > 1:
-            module = ast.Module(body=tree.body[:-1], type_ignores=[])
-            exec(compile(module, "<repl>", "exec"), namespace)
-
-        expr = ast.Expression(body=last.value)
-        return eval(compile(expr, "<repl>", "eval"), namespace)
-    else:
-        exec(compile(tree, "<repl>", "exec"), namespace)
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -494,21 +288,7 @@ def _try_exec(code: str, namespace: dict) -> object | None:
 
 
 def cmd(args, input_values=None, on_input=None, encoding="gbk", chunk_size=1024, **kwargs):
-    """Execute a command with streaming output and optional interactive input.
-
-    Args:
-        args: Command and arguments (list or string).
-        input_values: Dict mapping output prompts (bytes) to input responses (bytes).
-        on_input: Callable that receives the last output line (bytes) and returns
-            input bytes or None.
-        encoding: Output decoding encoding. Default 'gbk' for Windows.
-        chunk_size: Read chunk size in bytes.
-        **kwargs: Additional arguments passed to subprocess.Popen.
-
-    Returns:
-        CmdResult object that is iterable (yields decoded output chunks)
-        and has .return_code and .output attributes after iteration completes.
-    """
+    """Execute a command with streaming output and optional interactive input."""
     if input_values is not None and not isinstance(input_values, dict):
         raise TypeError("input_values must be a dict.")
 
@@ -585,11 +365,7 @@ manager = SessionManager()
 
 
 @mcp.tool()
-def create_session(
-    session_id: str | None = None,
-    cwd: str | None = None,
-    sys_paths: list[str] | None = None,
-) -> str:
+def create_session(session_id: str | None = None) -> str:
     """Create a new Python REPL session.
 
     Each session has its own isolated namespace for variable storage
@@ -597,26 +373,17 @@ def create_session(
 
     Args:
         session_id: Optional custom session ID. Auto-generated if not provided.
-        cwd: Optional working directory for the session. Code execution will
-            use this as the current directory, and it's also added to sys.path.
-        sys_paths: Optional list of additional paths to add to sys.path,
-            allowing imports from those directories.
 
     Returns:
         JSON with the created session info.
     """
     try:
-        session = manager.create_session(session_id, cwd=cwd, sys_paths=sys_paths)
-        result = {
+        session = manager.create_session(session_id)
+        return json.dumps({
             "status": "success",
             "session_id": session.session_id,
             "message": f"Session '{session.session_id}' created successfully",
-        }
-        if session.cwd:
-            result["cwd"] = session.cwd
-        if session.sys_paths:
-            result["sys_paths"] = session.sys_paths
-        return json.dumps(result)
+        })
     except ValueError as e:
         return json.dumps({"status": "error", "message": str(e)})
 
@@ -649,7 +416,8 @@ def reset_session(session_id: str) -> str:
         JSON with the operation result.
     """
     try:
-        manager.reset_session(session_id)
+        session = manager.get_session(session_id)
+        session.reset()
         return json.dumps({
             "status": "success",
             "message": f"Session '{session_id}' has been reset",
@@ -663,12 +431,10 @@ def reset_run_context(session_id: str) -> str:
     """Recreate a fresh Python interpreter execution environment for a session.
 
     Unlike reset_session which only clears variables and history, this fully
-    recreates the runtime context: unloads session-imported modules from
-    sys.modules, resets sys.path modifications, and provides a completely
-    clean namespace as if a new Python interpreter was started.
+    recreates the runtime context: kills the worker process and starts a new one,
+    providing a completely clean environment as if a new Python interpreter was started.
 
-    The session keeps its configuration (cwd, sys_paths) but all runtime
-    state is discarded.
+    The session keeps its history but all runtime state is discarded.
 
     Args:
         session_id: The ID of the session to reset.
@@ -677,7 +443,8 @@ def reset_run_context(session_id: str) -> str:
         JSON with the operation result.
     """
     try:
-        manager.reset_run_context(session_id)
+        session = manager.get_session(session_id)
+        session.reset_run_context()
         return json.dumps({
             "status": "success",
             "message": f"Session '{session_id}' runtime context has been recreated",
@@ -712,8 +479,8 @@ def delete_session(session_id: str) -> str:
 def run_code(
     session_id: str,
     code: str | None = None,
-    start_line: int | None = None,
-    end_line: int | None = None,
+    start: int | None = None,
+    end: int | None = None,
     timeout: int | None = None,
 ) -> str:
     """Execute Python code in the specified session.
@@ -723,21 +490,29 @@ def run_code(
     expression, its value will be returned.
 
     There are two modes:
-    1. Provide code directly (optionally sliced by start_line/end_line).
-    2. Omit code and use start_line/end_line to index into the session's
-       history, concatenating the code from those history records (skipping
-       system records) and executing the result.
+    1. Provide code directly (optionally sliced by start/end which refer
+       to line numbers within the code).
+    2. Omit code and use start/end to index into the session's history,
+       concatenating the code from those blocks and executing the result.
 
-    Line numbers are 1-based and inclusive.
+    Indexing follows standard Python slicing conventions:
+      - 0-based indexing.
+      - Half-open interval [start, end): start inclusive, end exclusive.
+      - Negative values count from end: -1 = last item.
+      - None defaults: start=None → beginning, end=None → end.
+      - Out-of-range values are clamped gracefully.
+
+    Examples (assuming 5 history blocks [0..4]):
+      start=0, end=2  → blocks 0 and 1
+      start=-1        → last block only
+      start=1, end=-1 → blocks 1, 2, 3 (excludes last)
 
     Args:
         session_id: The session to execute code in.
         code: The Python code to execute. If omitted, code is assembled from history.
-        start_line: 1-based start index. When code is provided, slices code lines.
-            When code is omitted, indexes into history records.
-        end_line: 1-based end index (inclusive). Same semantics as start_line.
+        start: Start index (inclusive). See slicing rules above.
+        end: End index (exclusive). See slicing rules above.
         timeout: Execution timeout in seconds. Default is None (no timeout).
-            Set a positive value to limit execution time.
 
     Returns:
         The execution result formatted as interactive Python REPL output.
@@ -748,55 +523,48 @@ def run_code(
         return json.dumps({"status": "error", "message": str(e)})
 
     if code:
-        # Slice provided code by line range
-        if start_line is not None or end_line is not None:
+        if start is not None or end is not None:
             all_lines = code.splitlines()
             total = len(all_lines)
-            s = (start_line - 1) if start_line and start_line >= 1 else 0
-            e = end_line if end_line and end_line <= total else total
-            if s >= total or s < 0 or e < 1 or s >= e:
+            s, e = _resolve_slice(start, end, total)
+            if s >= e:
                 return json.dumps({
                     "status": "error",
-                    "message": f"Invalid line range: start_line={start_line}, end_line={end_line} (code has {total} lines)",
+                    "message": f"Empty slice: start={start}, end={end} (code has {total} lines)",
                 })
             code = "\n".join(all_lines[s:e])
     else:
-        # Assemble code from history records using start_line/end_line as record indices
-        if start_line is None and end_line is None:
+        if start is None and end is None:
             return json.dumps({"status": "error", "message": "No code provided"})
 
         total = len(session.history)
-        s = (start_line - 1) if start_line and start_line >= 1 else 0
-        e = end_line if end_line and end_line <= total else total
-        if s >= total or s < 0 or e < 1 or s >= e:
+        s, e = _resolve_slice(start, end, total)
+        if s >= e:
             return json.dumps({
                 "status": "error",
-                "message": f"Invalid range: start_line={start_line}, end_line={end_line} (history has {total} records)",
+                "message": f"Empty slice: start={start}, end={end} (history has {total} blocks)",
             })
 
         code_parts: list[str] = []
         for record in session.history[s:e]:
-            if record.record_type == "system":
-                continue
             code_parts.append(record.code)
 
         if not code_parts:
-            return json.dumps({"status": "error", "message": "No executable code in the specified history range"})
+            return json.dumps({"status": "error", "message": "No executable code in the specified range"})
 
         code = "\n".join(code_parts)
 
-    record = execute_code(session, code, timeout=timeout)
+    record = session.execute(code, timeout=timeout)
 
-    # Line number = total history records count (this record is the latest)
     line_num = len(session.history)
-
     parts: list[str] = []
-    lines = code.splitlines()
+    lines = code.strip("\n").splitlines()
+    prefix = f"[{line_num}]"
     for i, line in enumerate(lines):
         if i == 0:
-            parts.append(f"[{line_num}] >>> {line}")
+            parts.append(f"{prefix} {line}")
         else:
-            parts.append(f"{'':>{len(str(line_num)) + 2}} ... {line}")
+            parts.append(f"{' ' * len(prefix)} {line}")
 
     if record.success:
         if record.output:
@@ -809,34 +577,298 @@ def run_code(
 
 
 @mcp.tool()
-def get_history(session_id: str, n: int | None = None) -> str:
-    """Get the execution history of a session, formatted like a Python interactive REPL.
+def run_file(
+    session_id: str,
+    path: str,
+    timeout: int | None = None,
+) -> str:
+    """Execute a Python file in the specified session.
 
-    Output looks like:
-        [1] >>> a = 1
-        [2] >>> a
-        1
-        [3] >>> b
-        Traceback (most recent call last):
-          File "<stdin>", line 1, in <module>
-        NameError: name 'b' is not defined
+    Reads the file content and executes it within the session's namespace,
+    equivalent to running `exec(open(path).read())` in the session.
 
     Args:
-        session_id: The session to get history from.
-        n: Number of recent entries to return. None or 0 means all history.
+        session_id: The session to execute the file in.
+        path: Path to the Python file to execute.
+        timeout: Execution timeout in seconds. Default is None (no timeout).
 
     Returns:
-        The execution history formatted as interactive Python REPL output
-        with line numbers for reference in run_code and delete_history.
+        The execution result formatted as interactive Python REPL output.
     """
     try:
         session = manager.get_session(session_id)
     except KeyError as e:
         return json.dumps({"status": "error", "message": str(e)})
 
-    count = n if n and n > 0 else None
-    formatted = session.format_history(count)
+    abs_path = os.path.abspath(path)
+    if not os.path.isfile(abs_path):
+        return json.dumps({"status": "error", "message": f"File not found: '{abs_path}'"})
+
+    try:
+        with open(abs_path, "r", encoding="utf-8") as f:
+            code = f.read()
+    except Exception as ex:
+        return json.dumps({"status": "error", "message": f"Failed to read file: {str(ex)}"})
+
+    if not code.strip():
+        return json.dumps({"status": "error", "message": "File is empty"})
+
+    record = session.execute(code, timeout=timeout)
+
+    line_num = len(session.history)
+    filename = os.path.basename(abs_path)
+    parts: list[str] = [f"[{line_num}] exec('{filename}')"]
+
+    if record.success:
+        if record.output:
+            parts.append(record.output)
+    else:
+        if record.error:
+            parts.append(record.error)
+
+    return "\n".join(parts)
+
+
+@mcp.tool()
+def rerun_code(
+    session_id: str,
+    start: int | None = None,
+    end: int | None = None,
+    timeout: int | None = None,
+) -> str:
+    """Reset the session's run context and re-execute history code from scratch.
+
+    This is equivalent to calling reset_run_context followed by sequentially
+    re-executing each history block. Useful when you want a clean re-run of
+    all (or a range of) previous code without accumulated side effects.
+
+    The history is preserved before reset. After reset_run_context, each block
+    in the specified range is executed in order. The new execution results
+    replace the old history.
+
+    Indexing follows standard Python slicing conventions:
+      - 0-based, half-open interval [start, end).
+      - Negative values count from end. None = default boundary.
+
+    Args:
+        session_id: The session to rerun.
+        start: Start index (inclusive). Default: beginning.
+        end: End index (exclusive). Default: end of history.
+        timeout: Execution timeout in seconds per block. Default is None (no timeout).
+
+    Returns:
+        The execution results formatted as interactive Python REPL output.
+    """
+    try:
+        session = manager.get_session(session_id)
+    except KeyError as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+    total = len(session.history)
+    if total == 0:
+        return json.dumps({"status": "error", "message": "No history to rerun"})
+
+    s, e = _resolve_slice(start, end, total)
+    if s >= e:
+        return json.dumps({
+            "status": "error",
+            "message": f"Empty slice: start={start}, end={end} (history has {total} blocks)",
+        })
+
+    # Extract code from the target history range
+    code_snippets = [record.code for record in session.history[s:e]]
+
+    # Kill worker and start fresh (true reset)
+    session.reset_run_context()
+    session.history.clear()
+
+    # Re-execute each record sequentially
+    output_parts: list[str] = []
+    for code in code_snippets:
+        record = session.execute(code, timeout=timeout)
+        line_num = len(session.history)
+
+        lines = code.strip("\n").splitlines()
+        prefix = f"[{line_num}]"
+        for i, line in enumerate(lines):
+            if i == 0:
+                output_parts.append(f"{prefix} {line}")
+            else:
+                output_parts.append(f"{' ' * len(prefix)} {line}")
+
+        if record.success:
+            if record.output:
+                output_parts.append(record.output)
+        else:
+            if record.error:
+                output_parts.append(record.error)
+
+        output_parts.append("")
+
+    if output_parts and output_parts[-1] == "":
+        output_parts.pop()
+
+    return "\n".join(output_parts)
+
+
+@mcp.tool()
+def get_history(session_id: str, start: int | None = None, end: int | None = None) -> str:
+    """Get the execution history of a session, formatted like a Python interactive REPL.
+
+    Output looks like:
+        [1] a = 1
+        [2] a
+        1
+        [3] b
+        Traceback (most recent call last):
+          File "<stdin>", line 1, in <module>
+        NameError: name 'b' is not defined
+
+    Indexing follows standard Python slicing conventions:
+      - 0-based, half-open interval [start, end).
+      - Negative values count from end. None = default boundary.
+
+    Examples (assuming 5 blocks):
+      start=0, end=2  → first 2 blocks
+      start=-2        → last 2 blocks
+      (no args)       → all blocks
+
+    Args:
+        session_id: The session to get history from.
+        start: Start index (inclusive). Default: beginning.
+        end: End index (exclusive). Default: end of history.
+
+    Returns:
+        The execution history formatted as interactive Python REPL output.
+    """
+    try:
+        session = manager.get_session(session_id)
+    except KeyError as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+    formatted = session.format_history(start, end)
     return formatted
+
+
+@mcp.tool()
+def delete_history(
+    session_id: str,
+    start: int,
+    end: int | None = None,
+) -> str:
+    """Delete a range of history blocks from a session.
+
+    Indexing follows standard Python slicing conventions:
+      - 0-based, half-open interval [start, end).
+      - Negative values count from end. None = default boundary.
+      - If end is omitted, deletes the single block at start index.
+
+    Examples:
+      start=0, end=2  → delete first 2 blocks
+      start=-1        → delete last block
+      start=2         → delete block at index 2
+
+    Args:
+        session_id: The session to delete history from.
+        start: Start index (inclusive).
+        end: End index (exclusive). Defaults to start+1 (single block).
+
+    Returns:
+        JSON with the operation result.
+    """
+    try:
+        session = manager.get_session(session_id)
+    except KeyError as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+    total = len(session.history)
+    if total == 0:
+        return json.dumps({"status": "error", "message": "No history to delete"})
+
+    if end is None:
+        # Single block deletion: resolve start index then delete one
+        s, _ = _resolve_slice(start, None, total)
+        e = s + 1
+        if s >= total:
+            return json.dumps({
+                "status": "error",
+                "message": f"Index out of range: start={start} (history has {total} blocks)",
+            })
+    else:
+        s, e = _resolve_slice(start, end, total)
+
+    if s >= e:
+        return json.dumps({
+            "status": "error",
+            "message": f"Empty slice: start={start}, end={end} (history has {total} blocks)",
+        })
+
+    deleted_count = e - s
+    del session.history[s:e]
+
+    return json.dumps({
+        "status": "success",
+        "message": f"Deleted {deleted_count} block(s) from history",
+        "remaining": len(session.history),
+    })
+
+
+@mcp.tool()
+def export_history(
+    session_id: str,
+    path: str,
+    start: int | None = None,
+    end: int | None = None,
+) -> str:
+    """Save execution history to a file, including code and output.
+
+    Extracts the formatted execution history (code + output) from the
+    specified range and writes to the given file path.
+
+    Indexing follows standard Python slicing conventions:
+      - 0-based, half-open interval [start, end).
+      - Negative values count from end. None = default boundary.
+
+    Args:
+        session_id: The session to extract history from.
+        path: File path to save the history (e.g. 'history.txt').
+        start: Start index (inclusive). Default: beginning.
+        end: End index (exclusive). Default: end of history.
+
+    Returns:
+        JSON with the operation result.
+    """
+    try:
+        session = manager.get_session(session_id)
+    except KeyError as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+    total = len(session.history)
+    if total == 0:
+        return json.dumps({"status": "error", "message": "No history to export"})
+
+    s, e = _resolve_slice(start, end, total)
+    if s >= e:
+        return json.dumps({
+            "status": "error",
+            "message": f"Empty slice: start={start}, end={end} (history has {total} blocks)",
+        })
+
+    formatted = session.format_history(start, end)
+
+    try:
+        abs_path = os.path.abspath(path)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        with open(abs_path, "w", encoding="utf-8") as f:
+            f.write(formatted + "\n")
+        return json.dumps({
+            "status": "success",
+            "message": f"History exported to '{abs_path}'",
+            "path": abs_path,
+            "blocks_exported": e - s,
+        })
+    except Exception as ex:
+        return json.dumps({"status": "error", "message": f"Failed to write file: {str(ex)}"})
 
 
 @mcp.tool()
@@ -879,70 +911,26 @@ def install_package(package_name: str) -> str:
 
 
 @mcp.tool()
-def delete_history(
-    session_id: str,
-    start_line: int,
-    end_line: int | None = None,
-) -> str:
-    """Delete a range of history records from a session.
-
-    Args:
-        session_id: The session to delete history from.
-        start_line: 1-based start record index (inclusive).
-        end_line: 1-based end record index (inclusive). Defaults to start_line
-            (delete a single record).
-
-    Returns:
-        JSON with the operation result.
-    """
-    try:
-        session = manager.get_session(session_id)
-    except KeyError as e:
-        return json.dumps({"status": "error", "message": str(e)})
-
-    total = len(session.history)
-    if total == 0:
-        return json.dumps({"status": "error", "message": "No history to delete"})
-
-    if end_line is None:
-        end_line = start_line
-
-    s = start_line - 1
-    e = end_line
-
-    if s < 0 or e > total or s >= e:
-        return json.dumps({
-            "status": "error",
-            "message": f"Invalid range: start_line={start_line}, end_line={end_line} (history has {total} records)",
-        })
-
-    deleted_count = e - s
-    del session.history[s:e]
-
-    return json.dumps({
-        "status": "success",
-        "message": f"Deleted {deleted_count} record(s) from history (lines {start_line}-{end_line})",
-        "remaining": len(session.history),
-    })
-
-
-@mcp.tool()
 def save_script(
     session_id: str,
     path: str,
-    start_line: int | None = None,
-    end_line: int | None = None,
+    start: int | None = None,
+    end: int | None = None,
 ) -> str:
     """Save history code to a Python script file.
 
-    Extracts code from the specified history range (skipping system records),
-    concatenates it, and writes to the given file path.
+    Extracts code from the specified range, concatenates it,
+    and writes to the given file path.
+
+    Indexing follows standard Python slicing conventions:
+      - 0-based, half-open interval [start, end).
+      - Negative values count from end. None = default boundary.
 
     Args:
         session_id: The session to extract code from.
         path: File path to save the script (e.g. 'output.py').
-        start_line: Optional 1-based start record index (inclusive). Default: 1.
-        end_line: Optional 1-based end record index (inclusive). Default: last record.
+        start: Start index (inclusive). Default: beginning.
+        end: End index (exclusive). Default: end of history.
 
     Returns:
         JSON with the operation result.
@@ -956,19 +944,15 @@ def save_script(
     if total == 0:
         return json.dumps({"status": "error", "message": "No history to save"})
 
-    s = (start_line - 1) if start_line and start_line >= 1 else 0
-    e = end_line if end_line and end_line <= total else total
-
-    if s >= total or s < 0 or e < 1 or s >= e:
+    s, e = _resolve_slice(start, end, total)
+    if s >= e:
         return json.dumps({
             "status": "error",
-            "message": f"Invalid range: start_line={start_line}, end_line={end_line} (history has {total} records)",
+            "message": f"Empty slice: start={start}, end={end} (history has {total} blocks)",
         })
 
     code_parts: list[str] = []
     for record in session.history[s:e]:
-        if record.record_type == "system":
-            continue
         code_parts.append(record.code)
 
     if not code_parts:
@@ -985,90 +969,10 @@ def save_script(
             "status": "success",
             "message": f"Script saved to '{abs_path}'",
             "path": abs_path,
-            "lines_saved": len(code_parts),
+            "blocks_saved": len(code_parts),
         })
     except Exception as ex:
         return json.dumps({"status": "error", "message": f"Failed to write file: {str(ex)}"})
-
-
-@mcp.tool()
-def run_file(
-    session_id: str,
-    path: str,
-    timeout: int | None = None,
-) -> str:
-    """Execute a Python file in the specified session.
-
-    Reads the file content and executes it within the session's namespace,
-    equivalent to running `exec(open(path).read())` in the session.
-    The file's parent directory is temporarily added to sys.path during execution.
-
-    Args:
-        session_id: The session to execute the file in.
-        path: Path to the Python file to execute.
-        timeout: Execution timeout in seconds. Default is None (no timeout).
-
-    Returns:
-        The execution result formatted as interactive Python REPL output.
-    """
-    try:
-        session = manager.get_session(session_id)
-    except KeyError as e:
-        return json.dumps({"status": "error", "message": str(e)})
-
-    abs_path = os.path.abspath(path)
-    if not os.path.isfile(abs_path):
-        return json.dumps({"status": "error", "message": f"File not found: '{abs_path}'"})
-
-    try:
-        with open(abs_path, "r", encoding="utf-8") as f:
-            code = f.read()
-    except Exception as ex:
-        return json.dumps({"status": "error", "message": f"Failed to read file: {str(ex)}"})
-
-    if not code.strip():
-        return json.dumps({"status": "error", "message": "File is empty"})
-
-    # Temporarily add the file's directory to sys.path
-    file_dir = os.path.dirname(abs_path)
-    path_added = False
-    with _path_lock:
-        if file_dir not in sys.path:
-            sys.path.insert(0, file_dir)
-            path_added = True
-
-    # Set __file__ in the session namespace during execution
-    old_file = session.namespace.get("__file__")
-    session.namespace["__file__"] = abs_path
-
-    try:
-        record = execute_code(session, code, timeout=timeout)
-    finally:
-        # Restore __file__
-        if old_file is None:
-            session.namespace.pop("__file__", None)
-        else:
-            session.namespace["__file__"] = old_file
-        # Remove temporarily added path
-        if path_added:
-            with _path_lock:
-                if file_dir in sys.path:
-                    sys.path.remove(file_dir)
-
-    # Format output
-    line_num = len(session.history)
-    filename = os.path.basename(abs_path)
-
-    parts: list[str] = [f"[{line_num}] >>> exec('{filename}')"]
-
-    if record.success:
-        if record.output:
-            parts.append(record.output)
-    else:
-        if record.error:
-            parts.append(record.error)
-
-    return "\n".join(parts)
 
 
 def main() -> None:

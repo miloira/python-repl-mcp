@@ -1,5 +1,9 @@
 """Allow running with `python -m python_repl_mcp`."""
 
+import multiprocessing
+
 from .server import main
 
-main()
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    main()
