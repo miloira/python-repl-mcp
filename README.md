@@ -5,15 +5,16 @@
 ## 功能特性
 
 - **多会话管理** - 创建、列出、重置、删除独立的 Python 执行会话
+- **进程级隔离** - 每个会话运行在独立的 worker 进程中，互不干扰
 - **代码执行** - 在指定会话中执行 Python 代码，自动捕获 stdout/stderr
-- **文件执行** - 直接在会话中执行 Python 文件，自动处理 sys.path 和 `__file__`
+- **文件执行** - 直接在会话中执行 Python 文件
 - **表达式求值** - 自动检测最后一条语句是否为表达式并返回其值（类似 IPython）
-- **超时控制** - 代码执行默认不超时，可设置 timeout 参数限制执行时间
-- **工作目录** - 创建会话时可指定 cwd 和 sys_paths
-- **执行历史** - 交互式 REPL 风格输出（`>>>` 格式），支持查看最近 N 条或全部
-- **历史回放** - 从历史记录中提取代码重新执行
-- **脚本导出** - 将历史代码保存为 .py 文件
-- **运行时重置** - 深度重置会话（卸载导入的模块、恢复 sys.path）
+- **超时控制** - 可设置 timeout 参数限制执行时间，超时自动终止并重启 worker
+- **执行历史** - 带编号的代码块格式输出，支持 Python 切片索引
+- **历史回放** - 重置运行时并从历史中重新执行代码
+- **历史导出** - 将完整执行记录（代码+输出）导出到文件
+- **脚本导出** - 将历史代码（仅代码）保存为 .py 文件
+- **运行时重置** - 终止 worker 进程并启动新进程，保留历史记录
 - **包安装** - 通过 pip 安装 Python 包
 - **多通信方式** - 通过环境变量切换 stdio / SSE / Streamable HTTP 传输
 
@@ -88,11 +89,27 @@ pip install python-repl-mcp
 }
 ```
 
-### 示例：使用 Streamable HTTP 模式
+## 索引规则
 
-```bash
-MCP_TRANSPORT=streamable-http MCP_HOST=0.0.0.0 MCP_PORT=9000 python -m python_repl_mcp
-```
+所有接受 `start`/`end` 参数的工具，均遵循 **标准 Python 切片** 约定：
+
+- **0-based** — 第一个代码块索引为 0
+- **半开区间 `[start, end)`** — start 包含，end 不包含
+- **负数索引** — `-1` 表示最后一个，`-2` 表示倒数第二个
+- **None 默认值** — `start=None` 从头开始，`end=None` 到末尾
+- **越界自动截断** — 不会报错，同 Python 切片行为
+
+示例（假设有 5 个代码块）：
+
+| 参数 | 效果 | 等价 Python |
+|------|------|------------|
+| `start=0, end=2` | 前 2 个块 | `lst[0:2]` |
+| `start=-1` | 最后 1 个块 | `lst[-1:]` |
+| `start=-2` | 最后 2 个块 | `lst[-2:]` |
+| `start=1, end=-1` | 去掉首尾 | `lst[1:-1]` |
+| 不传参数 | 全部 | `lst[:]` |
+
+> 注意：输出中显示的编号 `[1]`, `[2]`, `[3]` 是 1-based 的人类可读编号，API 参数使用 0-based 索引。
 
 ## 工具列表
 
@@ -102,11 +119,9 @@ MCP_TRANSPORT=streamable-http MCP_HOST=0.0.0.0 MCP_PORT=9000 python -m python_re
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | session_id | string | 否 | 自定义会话ID，不提供则自动生成 |
-| cwd | string | 否 | 工作目录，执行代码时自动切换，同时加入 sys.path |
-| sys_paths | list[string] | 否 | 额外的包搜索路径列表 |
 
 ### `list_sessions`
-列出所有活跃的会话及其元数据，包括 cwd、sys_paths、history_count、variable_count 等。
+列出所有活跃的会话及其元数据（session_id、created_at、history_count、alive）。
 
 ### `reset_session`
 重置会话的命名空间和执行历史，会话本身保留。
@@ -116,7 +131,7 @@ MCP_TRANSPORT=streamable-http MCP_HOST=0.0.0.0 MCP_PORT=9000 python -m python_re
 | session_id | string | 是 | 要重置的会话ID |
 
 ### `reset_run_context`
-深度重置：卸载会话中导入的模块、恢复 sys.path、清空命名空间（保留历史记录）。
+终止当前 worker 进程并启动新进程，提供全新的 Python 解释器环境。历史记录保留。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
@@ -136,24 +151,44 @@ MCP_TRANSPORT=streamable-http MCP_HOST=0.0.0.0 MCP_PORT=9000 python -m python_re
 |------|------|------|------|
 | session_id | string | 是 | 执行代码的会话ID |
 | code | string | 否 | 要执行的 Python 代码（不提供则从历史中提取） |
-| start_line | integer | 否 | 起始行号（1-based），用于切片代码或索引历史 |
-| end_line | integer | 否 | 结束行号（1-based, inclusive） |
-| timeout | integer | 否 | 执行超时秒数，默认 None（不超时），设置正数限制执行时间 |
+| start | integer | 否 | 起始索引（Python 切片规则） |
+| end | integer | 否 | 结束索引（Python 切片规则） |
+| timeout | integer | 否 | 执行超时秒数，默认不超时 |
+
+### `run_file`
+在指定会话中执行一个 Python 文件。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| session_id | string | 是 | 执行文件的会话ID |
+| path | string | 是 | Python 文件路径 |
+| timeout | integer | 否 | 执行超时秒数，默认不超时 |
+
+### `rerun_code`
+重置运行时环境，从历史记录中重新执行代码。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| session_id | string | 是 | 会话ID |
+| start | integer | 否 | 起始索引（Python 切片规则） |
+| end | integer | 否 | 结束索引（Python 切片规则） |
+| timeout | integer | 否 | 每个代码块的超时秒数 |
 
 ### `get_history`
-获取会话的执行历史，以交互式 Python REPL 格式输出。
+获取会话的执行历史。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | session_id | string | 是 | 要查看的会话ID |
-| n | integer | 否 | 返回最近 N 条记录，不传则返回全部 |
+| start | integer | 否 | 起始索引（Python 切片规则） |
+| end | integer | 否 | 结束索引（Python 切片规则） |
 
 输出示例：
 ```
-[1] >>> a = 1
-[2] >>> a
+[1] a = 1
+[2] a
 1
-[3] >>> b
+[3] b
 Traceback (most recent call last):
   File "<stdin>", line 1, in <module>
 NameError: name 'b' is not defined
@@ -165,27 +200,28 @@ NameError: name 'b' is not defined
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | session_id | string | 是 | 会话ID |
-| start_line | integer | 是 | 起始记录索引（1-based, inclusive） |
-| end_line | integer | 否 | 结束记录索引（1-based, inclusive），默认等于 start_line |
+| start | integer | 是 | 起始索引（Python 切片规则） |
+| end | integer | 否 | 结束索引，不传则删除 start 处的单个代码块 |
+
+### `export_history`
+将执行历史（代码+输出）导出到文件。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| session_id | string | 是 | 会话ID |
+| path | string | 是 | 保存路径（如 'history.txt'） |
+| start | integer | 否 | 起始索引（Python 切片规则） |
+| end | integer | 否 | 结束索引（Python 切片规则） |
 
 ### `save_script`
-将历史代码导出为 Python 脚本文件。
+将历史代码（仅代码，不含输出）导出为 Python 脚本文件。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | session_id | string | 是 | 会话ID |
 | path | string | 是 | 保存路径（如 'output.py'） |
-| start_line | integer | 否 | 起始记录索引，默认 1 |
-| end_line | integer | 否 | 结束记录索引，默认最后一条 |
-
-### `run_file`
-在指定会话中执行一个 Python 文件。文件内容在会话的命名空间中执行，执行期间文件所在目录会临时加入 sys.path。
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| session_id | string | 是 | 执行文件的会话ID |
-| path | string | 是 | Python 文件路径 |
-| timeout | integer | 否 | 执行超时秒数，默认不超时 |
+| start | integer | 否 | 起始索引（Python 切片规则） |
+| end | integer | 否 | 结束索引（Python 切片规则） |
 
 ### `install_package`
 通过 pip 安装 Python 包到当前环境，安装后所有会话可用。
@@ -197,46 +233,46 @@ NameError: name 'b' is not defined
 ## 使用示例
 
 ```
-1. create_session(session_id="demo", cwd="/my/project")
+1. create_session(session_id="demo")
 
 2. run_code(session_id="demo", code="import math\nresult = math.sqrt(144)\nresult")
-   → [1] >>> import math
-          ... result = math.sqrt(144)
-          ... result
+   → [1] import math
+         result = math.sqrt(144)
+         result
      12.0
 
 3. run_code(session_id="demo", code="result + 1")
-   → [2] >>> result + 1
+   → [2] result + 1
      13.0
 
 4. run_file(session_id="demo", path="/my/project/utils.py")
-   → [3] >>> exec('utils.py')
+   → [3] exec('utils.py')
      Loaded 5 utility functions.
 
-5. run_code(session_id="demo", code="my_util_func(42)")
-   → [4] >>> my_util_func(42)
-     84
-
-6. get_history(session_id="demo")
-   → [1] >>> import math
-          ... result = math.sqrt(144)
-          ... result
+5. get_history(session_id="demo")
+   → [1] import math
+         result = math.sqrt(144)
+         result
      12.0
 
-     [2] >>> result + 1
+     [2] result + 1
      13.0
 
-     [3] >>> exec('utils.py')
+     [3] exec('utils.py')
      Loaded 5 utility functions.
 
-     [4] >>> my_util_func(42)
-     84
+6. get_history(session_id="demo", start=-1)
+   → [3] exec('utils.py')
+     Loaded 5 utility functions.
 
-7. save_script(session_id="demo", path="demo.py")
+7. export_history(session_id="demo", path="history.txt")
+   → History exported to 'history.txt'
+
+8. save_script(session_id="demo", path="demo.py")
    → Script saved to 'demo.py'
 
-8. reset_run_context(session_id="demo")  # 深度重置，保留历史
-9. delete_session(session_id="demo")
+9. reset_run_context(session_id="demo")
+10. delete_session(session_id="demo")
 ```
 
 ## 项目结构
@@ -247,7 +283,9 @@ python-repl-mcp/
 ├── README.md
 └── python_repl_mcp/
     ├── __init__.py
-    └── server.py      # 单文件实现：会话管理、代码执行、MCP工具
+    ├── __main__.py
+    ├── server.py      # MCP 服务器：会话管理、工具定义
+    └── worker.py      # Worker 进程：代码执行引擎
 ```
 
 ## 开发

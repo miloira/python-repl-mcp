@@ -357,8 +357,8 @@ def cmd(args, input_values=None, on_input=None, encoding="gbk", chunk_size=1024,
 
 mcp = FastMCP(
     "python-repl",
-    host=os.environ.get("MCP_HOST", "127.0.0.1"),
-    port=int(os.environ.get("MCP_PORT", "8000")),
+    host=os.environ.get("MCP_HOST", "127.0.0.1").strip(),
+    port=int(os.environ.get("MCP_PORT", "8000").strip()),
 )
 
 manager = SessionManager()
@@ -987,7 +987,7 @@ def main() -> None:
       - MCP_HOST: Host to bind (default "127.0.0.1")
       - MCP_PORT: Port to bind (default 8000)
     """
-    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    transport = os.environ.get("MCP_TRANSPORT", "stdio").strip()
     if transport not in ("stdio", "sse", "streamable-http"):
         raise ValueError(
             f"Invalid MCP_TRANSPORT='{transport}'. "
